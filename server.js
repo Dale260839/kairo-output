@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 
 import { openai, getIndex } from "./lib/clients.js";
 
@@ -19,25 +20,77 @@ const EMBEDDING_MODEL = "text-embedding-3-small";
 
 const PORT = process.env.PORT || 3000;
 
-// CORS: the frontend is a static index.html on Netlify, embedded in a GHL
-// iframe, calling this API cross-origin. Allow that origin (FRONTEND_ORIGIN),
-// falling back to the legacy ALLOWED_ORIGIN, then "*" only if neither is set.
-const FRONTEND_ORIGIN =
-  process.env.FRONTEND_ORIGIN || process.env.ALLOWED_ORIGIN || "*";
+// Allowed frontend origin(s). The frontend is a static index.html on Netlify,
+// embedded in a GHL iframe, calling this API cross-origin and sending NO
+// credential. FRONTEND_ORIGIN is comma-separated to allow more than one value
+// (falls back to legacy ALLOWED_ORIGIN). Used for BOTH the CORS config and the
+// server-side origin allowlist check below.
+const ALLOWED_ORIGINS = (
+  process.env.FRONTEND_ORIGIN ||
+  process.env.ALLOWED_ORIGIN ||
+  ""
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
+// Express is behind Railway's reverse proxy; trust the first hop so the client
+// IP (X-Forwarded-For) is used for rate limiting rather than the proxy's IP.
 const app = express();
+app.set("trust proxy", 1);
 
-// Allow POST + OPTIONS and the Content-Type/x-api-key request headers. The
-// cors middleware also answers the OPTIONS preflight automatically. No cookies
-// are used, so credentials are not enabled.
+// CORS: allow the configured origin(s) (or any, if none configured), POST +
+// OPTIONS, and the Content-Type request header. The cors middleware also
+// answers the OPTIONS preflight automatically. No cookies/credentials.
 app.use(
   cors({
-    origin: FRONTEND_ORIGIN,
+    origin: ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : "*",
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "x-api-key"],
+    allowedHeaders: ["Content-Type"],
   })
 );
 app.use(express.json());
+
+// ---------------------------------------------------------------------------
+// Server-side origin allowlist (separate from CORS)
+// ---------------------------------------------------------------------------
+// CORS only governs browsers; it does NOT stop non-browser clients (curl,
+// scripts) from calling the API. This middleware enforces the allowlist on the
+// server for every /generate request. If FRONTEND_ORIGIN is unset there is
+// nothing to check against, so it allows through (set it in production!).
+function requireAllowedOrigin(req, res, next) {
+  if (ALLOWED_ORIGINS.length === 0) return next();
+
+  // Prefer the Origin header; fall back to the origin parsed from Referer.
+  let origin = req.get("origin");
+  if (!origin) {
+    const referer = req.get("referer");
+    if (referer) {
+      try {
+        origin = new URL(referer).origin;
+      } catch {
+        origin = null;
+      }
+    }
+  }
+
+  if (!origin || !ALLOWED_ORIGINS.includes(origin)) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting for /generate
+// ---------------------------------------------------------------------------
+// Cap each client IP to 30 requests per 10-minute window; 429 when exceeded.
+const generateLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 30, // 30 requests per IP per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later." },
+});
 
 // ---------------------------------------------------------------------------
 // Health check
@@ -49,13 +102,9 @@ app.get("/health", (_req, res) => {
 // ---------------------------------------------------------------------------
 // Proposal generation
 // ---------------------------------------------------------------------------
-app.post("/generate", async (req, res) => {
-  // Shared-secret check. Require a matching x-api-key header.
-  const appSecret = process.env.APP_SECRET;
-  if (appSecret && req.get("x-api-key") !== appSecret) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
+// Secured server-side via the origin allowlist + rate limiter (no client
+// credential). The request carries no auth header.
+app.post("/generate", generateLimiter, requireAllowedOrigin, async (req, res) => {
   try {
     const job = req.body || {};
     const { trade, scope, clientName, location, budget, notes } = job;
