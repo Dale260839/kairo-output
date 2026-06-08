@@ -4,6 +4,7 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 
 import { openai, getIndex } from "./lib/clients.js";
+import { upsertContact, uploadAttachment, sendEmail } from "./lib/ghl.js";
 
 // ---------------------------------------------------------------------------
 // Model configuration
@@ -49,7 +50,7 @@ app.use(
     allowedHeaders: ["Content-Type"],
   })
 );
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 // ---------------------------------------------------------------------------
 // Server-side origin allowlist (separate from CORS)
@@ -179,6 +180,79 @@ app.post("/generate", generateLimiter, requireAllowedOrigin, async (req, res) =>
   } catch (err) {
     console.error("Error generating proposal:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Send proposal via email (GoHighLevel Conversations API)
+// ---------------------------------------------------------------------------
+// Takes a generated proposal PDF (base64) and emails it to the client through
+// GHL so the message logs into the contact's Conversations thread. Sits behind
+// the same two middlewares as /generate (rate limiter, then origin allowlist).
+app.post("/send-email", generateLimiter, requireAllowedOrigin, async (req, res) => {
+  try {
+    const {
+      clientName,
+      clientEmail,
+      subject,
+      coverNoteHtml,
+      pdfBase64,
+      pdfFilename,
+    } = req.body || {};
+
+    if (!clientEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clientEmail)) {
+      return res.status(400).json({ error: "Valid clientEmail is required" });
+    }
+    if (!subject || typeof subject !== "string") {
+      return res.status(400).json({ error: "subject is required" });
+    }
+    if (!coverNoteHtml || typeof coverNoteHtml !== "string") {
+      return res.status(400).json({ error: "coverNoteHtml is required" });
+    }
+    if (!pdfBase64 || typeof pdfBase64 !== "string") {
+      return res.status(400).json({ error: "pdfBase64 is required" });
+    }
+
+    const trimmedName = (clientName || "").trim();
+    const spaceIdx = trimmedName.indexOf(" ");
+    const firstName = spaceIdx === -1 ? trimmedName : trimmedName.slice(0, spaceIdx);
+    const lastName  = spaceIdx === -1 ? ""           : trimmedName.slice(spaceIdx + 1);
+
+    const contactId = await upsertContact({
+      email: clientEmail, firstName, lastName,
+    });
+
+    const pdfBuffer = Buffer.from(pdfBase64, "base64");
+    if (pdfBuffer.length > 5 * 1024 * 1024) {
+      return res.status(413).json({ error: "PDF exceeds GHL's 5 MB attachment limit" });
+    }
+    if (pdfBuffer.length < 100) {
+      return res.status(400).json({ error: "PDF appears to be empty or malformed" });
+    }
+    const attachmentUrl = await uploadAttachment({
+      contactId,
+      buffer: pdfBuffer,
+      filename: pdfFilename || "proposal.pdf",
+      contentType: "application/pdf",
+    });
+
+    const result = await sendEmail({
+      contactId,
+      subject,
+      html: coverNoteHtml,
+      attachments: [attachmentUrl],
+      emailTo: clientEmail,
+    });
+
+    res.json({
+      ok: true,
+      contactId,
+      messageId: result?.messageId || result?.id || null,
+      conversationId: result?.conversationId || null,
+    });
+  } catch (err) {
+    console.error("[/send-email] error:", err);
+    res.status(500).json({ error: err.message || "Failed to send email" });
   }
 });
 

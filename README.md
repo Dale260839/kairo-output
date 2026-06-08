@@ -10,12 +10,50 @@ details → OpenAI writes a full proposal → it's returned as JSON.
 
 ## Endpoints
 
-| Method | Path        | Description                                      |
-| ------ | ----------- | ------------------------------------------------ |
-| GET    | `/health`   | Health check → `{ ok: true }`                    |
-| POST   | `/generate` | Generate a proposal → `{ proposal, sources_used }` |
+| Method | Path           | Description                                          |
+| ------ | -------------- | ---------------------------------------------------- |
+| GET    | `/health`      | Health check → `{ ok: true }`                        |
+| POST   | `/generate`    | Generate a proposal → `{ proposal, sources_used }`   |
+| POST   | `/send-email`  | Email a proposal PDF via GoHighLevel → `{ ok, contactId, messageId, conversationId }` |
 
-`POST /generate` requires an `x-api-key` header matching `APP_SECRET` (if set).
+`POST /generate` and `POST /send-email` carry no client credential. They are
+secured server-side by the same two middlewares: a rate limiter (30 req / 10
+min per IP → 429) and an origin allowlist checked against `FRONTEND_ORIGIN`
+(→ 403). See `.env.example` for details.
+
+## Send-to-Email (`POST /send-email`)
+
+Takes a generated proposal as a base64 PDF and sends it to the client via the
+GoHighLevel (LeadConnector) Conversations API, so the email logs into the
+contact's GHL Conversations thread. Flow: upsert the contact by email → upload
+the PDF to GHL → send an Email message with the cover-note HTML + the PDF
+attached.
+
+**Request body:**
+```json
+{
+  "clientName": "Jane Doe",
+  "clientEmail": "jane@example.com",
+  "subject": "Your roofing proposal",
+  "coverNoteHtml": "<p>Hi Jane, please find your proposal attached.</p>",
+  "pdfBase64": "<base64-encoded PDF>",
+  "pdfFilename": "proposal.pdf"
+}
+```
+
+**Extra env vars** (read from `process.env`; only required when `/send-email`
+is actually called — the server boots fine without them):
+
+| Var | Where to find it |
+| --- | ---------------- |
+| `GHL_PIT` | A **Private Integration Token** — GHL sub-account → **Settings → Private Integrations**. |
+| `GHL_LOCATION_ID` | The sub-account (location) ID — from the sub-account URL or **Settings → Business Profile**. |
+
+**Required PIT scopes:** `contacts.write`, `conversations.write`,
+`conversations/message.write`.
+
+> ⚠️ GoHighLevel caps email attachments at **5 MB**. PDFs larger than that are
+> rejected with `413` before upload.
 
 ## Requirements
 
